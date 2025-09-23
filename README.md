@@ -15,6 +15,10 @@
 
 This is the official implementation of the Dilated Unmasking Scheduler (DUS) paper for masked diffusion language models (MDLMs). 
 
+<div align="center">
+<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/models%20plot.png" alt="DUS Performance Overview" width="600"/>
+</div>
+
 ## Quick Start
 
 ### Requirements
@@ -45,9 +49,6 @@ pip install -r requirements.txt
 
 Masked diffusion language models (MDLMs) promise fast, non-autoregressive text generation, yet existing samplers, which pick tokens to unmask based on model confidence, ignore interactions when unmasking multiple positions in parallel and effectively reduce to slow, autoregressive behavior. We propose the **Dilated Unmasking Scheduler (DUS)**, an inference-only, planner-model-free method that partitions sequence positions into non-adjacent dilated groups and unmasks them in parallel so as to minimize an upper bound on joint entropy gain at each denoising step. By explicitly trading off the number of network calls against generation quality, DUS recovers most of the performance lost under traditional parallel unmasking strategies. Across math (GSM8K, MATH500), code (HumanEval, MBPP) and general‐knowledge benchmarks (BBH, MMLU-Pro), DUS outperforms confidence‐based planners—without modifying the underlying denoiser, and reveals the true speed-quality frontier of MDLMs.
 
-<div align="center">
-<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/models%20plot.png" alt="DUS Performance Overview" width="600"/>
-</div>
 
 ## Method Overview
 
@@ -71,7 +72,7 @@ Masked diffusion language models (MDLMs) promise fast, non-autoregressive text g
 <div align="center">
 <img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/generation_bar.png" alt="Generation Process" width="200"/>
 <br>
-<i>Generation process visualization: tokens are unmasked progressively from left to right</i>
+<i>Generation process visualization: blue indicates the start of unmasking, different colors show tokens unmasked at different stages</i>
 </div>
 
 ### Why Discrete Diffusion for LLMs?
