@@ -183,6 +183,10 @@ If you use this code in your research, please cite:
 }
 ```
 
+## Acknowledgments
+
+We thank the authors of [LLaDA](https://github.com/ML-GSAI/LLaDA) for their open-source implementation.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
