@@ -28,8 +28,8 @@ This is the official implementation of the Dilated Unmasking Scheduler (DUS) pap
 
 ### Installation
 ```bash
-git clone https://github.com/omerlux/DUS-for-MDLMs.git
-cd DUS-for-MDLMs
+git clone https://github.com/omerlux/DUS.git
+cd DUS
 pip install -r requirements.txt
 ```
 
