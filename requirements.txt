@@ -1,0 +1,8 @@
+# DUS: Dilated Unmasking Scheduler dependencies
+accelerate>=0.26.0
+datasets>=2.16.0
+torch>=1.8
+transformers>=4.1
+numpy
+tqdm
+lm-eval
