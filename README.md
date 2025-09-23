@@ -11,8 +11,6 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-**[Paper](https://arxiv.org/abs/2506.19037) | [Website](https://omerlux.github.io/DUS-for-MDLMs/) | [Assets](https://github.com/omerlux/DUS-for-MDLMs/tree/main/assets/imgs)**
-
 </div>
 
 This is the official implementation of the Dilated Unmasking Scheduler (DUS) paper for masked diffusion language models (MDLMs). 
@@ -46,7 +44,7 @@ pip install -r requirements.txt
 ## Abstract
 
 <div align="center">
-<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/models_plot.png" alt="DUS Performance Overview" width="600"/>
+<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/models%20plot.png" alt="DUS Performance Overview" width="600"/>
 </div>
 
 Masked diffusion language models (MDLMs) promise fast, non-autoregressive text generation, yet existing samplers, which pick tokens to unmask based on model confidence, ignore interactions when unmasking multiple positions in parallel and effectively reduce to slow, autoregressive behavior. We propose the **Dilated Unmasking Scheduler (DUS)**, an inference-only, planner-model-free method that partitions sequence positions into non-adjacent dilated groups and unmasks them in parallel so as to minimize an upper bound on joint entropy gain at each denoising step. By explicitly trading off the number of network calls against generation quality, DUS recovers most of the performance lost under traditional parallel unmasking strategies. Across math (GSM8K, MATH500), code (HumanEval, MBPP) and general‐knowledge benchmarks (BBH, MMLU-Pro), DUS outperforms confidence‐based planners—without modifying the underlying denoiser, and reveals the true speed-quality frontier of MDLMs.
@@ -54,7 +52,26 @@ Masked diffusion language models (MDLMs) promise fast, non-autoregressive text g
 ## Method Overview
 
 <div align="center">
-<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/bench-mat-code.png" alt="Benchmark Results" width="800"/>
+<table>
+<tr>
+<td align="center">
+<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/llada-base_gsm8k_452_dus.png" alt="DUS Scheduler" width="400"/>
+<br>
+<b>DUS (Dilated Unmasking Scheduler)</b>
+</td>
+<td align="center">
+<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/llada-base_gsm8k_452_conf.png" alt="Confidence-based Scheduler" width="400"/>
+<br>
+<b>Confidence-based Scheduler</b>
+</td>
+</tr>
+</table>
+</div>
+
+<div align="center">
+<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/generation_bar.png" alt="Generation Process" width="700"/>
+<br>
+<i>Generation process visualization: tokens are unmasked progressively from left to right</i>
 </div>
 
 ### Why Discrete Diffusion for LLMs?
@@ -107,6 +124,10 @@ DUS achieves significant speedups while maintaining competitive performance:
   - **Quality:** Preserves up to 75% of original performance quality
   - **Efficiency:** Requires only ⌈log G⌉ denoising steps for sequence length G
   - **Benchmarks:** Evaluated on GSM8K, MATH500, HumanEval, MBPP, BBH, and MMLU-Pro
+
+<div align="center">
+<img src="https://raw.githubusercontent.com/omerlux/DUS-for-MDLMs/main/assets/imgs/bench-mat-code.png" alt="Benchmark Results" width="800"/>
+</div>
 
 For detailed results and visualizations, see our [paper](https://arxiv.org/abs/2506.19037) and [website](https://omerlux.github.io/DUS-for-MDLMs/).
 
