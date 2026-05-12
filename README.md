@@ -4,12 +4,12 @@
 
 <div align="center">
 
+[![ICML 2026](https://img.shields.io/badge/ICML-2026-d4a017)](https://icml.cc/virtual/2026/poster/65445)
 [![Paper](https://img.shields.io/badge/Paper-arXiv:2506.19037-red)](https://arxiv.org/abs/2506.19037)
 [![Website](https://img.shields.io/badge/Website-Official-blue)](https://omerlux.github.io/DUS-for-MDLMs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 </div>
 
