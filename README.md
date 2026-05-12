@@ -242,7 +242,7 @@ If you use this code in your research, please cite:
     author  = {Luxembourg, Omer and Permuter, Haim and Nachmani, Eliya},
     journal = {arXiv preprint arXiv:2506.19037},
     year    = {2025},
-    note    = {Accepted at the International Conference on Machine Learning (ICML), 2026; final version forthcoming}
+    note    = {Accepted at the International Conference on Machine Learning (ICML), 2026}
 }
 ```
 
