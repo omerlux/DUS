@@ -92,19 +92,40 @@ def get_mask_by_confidence(logits: torch.Tensor, x0: torch.Tensor) -> torch.Tens
 def get_mask_by_entropy(logits: torch.Tensor) -> torch.Tensor:
     """
     Calculate entropy-based uncertainty for each token position.
-    
+
     Entropy measures the uncertainty in the model's prediction.
     Higher entropy indicates less certain predictions.
-    
+
     Args:
         logits: Model output logits of shape (batch_size, seq_len, vocab_size)
-        
+
     Returns:
         Entropy values for each position
     """
     p = F.softmax(logits.to(torch.float64), dim=-1)
     entropy = -torch.sum(p * torch.log(p + 1e-10), dim=-1)
     return entropy
+
+
+def get_raw_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Compute per-position entropy in bits for the EB-Sampler.
+
+    Distinct from :func:`get_mask_by_entropy` (which uses natural log) — this
+    variant uses log base 2 so the EB cumulative-entropy budget ``gamma`` is
+    in bits, matching the convention in Ben-Hamu et al. 2025 ("Accelerated
+    sampling from masked diffusion models via entropy bounded unmasking").
+
+    Args:
+        logits: Model output logits of shape (batch_size, seq_len, vocab_size)
+
+    Returns:
+        Entropy values in bits for each position, shape (batch_size, seq_len)
+    """
+    p = F.softmax(logits.to(torch.float64), dim=-1)
+    entropy = -torch.sum(p * torch.log2(p + 1e-10), dim=-1)
+    return entropy
+
 
 def check_stop_generation(
     x: torch.Tensor, 
@@ -381,13 +402,13 @@ def binary_search_levels(start: int, end: int, level: int = 0, out: Optional[Lis
 def merge_last_level(levels: List[List[int]]) -> List[List[int]]:
     """
     Merge the last level with the previous one if it's significantly smaller.
-    
+
     This optimization prevents having a tiny final level by merging it
     with the previous level when the last level has fewer elements.
-    
+
     Args:
         levels: List of unmasking levels
-        
+
     Returns:
         Modified levels list with potentially merged final level
     """
@@ -396,6 +417,48 @@ def merge_last_level(levels: List[List[int]]) -> List[List[int]]:
         levels[-2].extend(levels[-1])
         levels.pop()
     return levels
+
+
+def apply_spacing_filter(
+    selected_positions: List[int],
+    min_gap: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    Dilated-spacing post-filter for adaptive samplers (paper Sec 4.4).
+
+    Iterates the candidate positions in score order (best first) and greedily
+    accepts each one only if it is at least ``min_gap`` away from every
+    already-accepted position. Rejected candidates are deferred — the calling
+    sampler will reconsider them at the next denoising step with updated
+    context. When ``min_gap <= 1`` the filter is a no-op.
+
+    The adaptive gap used by :func:`generate_eb_sampler_spaced` and
+    :func:`generate_cb_sampler_spaced` is
+    ``min_gap = max(2, int(M * start_stride // B))``, where ``M`` is the
+    number of still-masked positions in the current block and ``B`` is the
+    block length. As the block fills (``M`` shrinks), the gap relaxes toward
+    1, recovering the underlying sampler.
+
+    Args:
+        selected_positions: Absolute positions chosen by the base sampler,
+            already sorted by score (best first).
+        min_gap: Minimum required distance between accepted positions.
+
+    Returns:
+        Tuple of (accepted, deferred). Accepted positions are unmasked now;
+        deferred positions stay masked for reconsideration next step.
+    """
+    if min_gap <= 1:
+        return selected_positions, []
+
+    accepted: List[int] = []
+    deferred: List[int] = []
+    for pos in selected_positions:
+        if all(abs(pos - a) >= min_gap for a in accepted):
+            accepted.append(pos)
+        else:
+            deferred.append(pos)
+    return accepted, deferred
 
 
 @torch.no_grad()
@@ -542,6 +605,540 @@ def generate_scheduled(
                         unmasking_stage[0, pos] = -1
 
             # Check for early stopping
+            if check_stop_generation(x, stop_tokens, stop_on_eos, mask_id, prompt_len):
+                stop_generation = True
+                break
+
+    return x, unmasking_stage
+
+
+@torch.no_grad()
+def generate_eb_sampler(
+    model: torch.nn.Module,
+    prompt: torch.Tensor,
+    steps: int = 128,
+    gen_length: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.,
+    cfg_scale: float = 0.,
+    mask_id: int = 126336,
+    gamma: float = 1.0,
+    stop_on_eos: bool = True,
+    stop_tokens: Optional[List[str]] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    EB-Sampler — entropy-bounded adaptive unmasking.
+
+    Reference: Ben-Hamu et al. 2025, "Accelerated sampling from masked
+    diffusion models via entropy bounded unmasking". At every denoising step,
+    masked positions are sorted by their conditional entropy and the largest
+    prefix is unmasked subject to the cumulative-entropy budget
+    ``gamma`` (bits). Specifically, ``k = (acc_entropy - cummax_entropy <=
+    gamma).sum()`` with at least one token always unmasked to guarantee
+    progress.
+
+    In our paper this is one of the adaptive baselines used in Appendix B.7
+    (5-model x 4-benchmark sweep) and as the substrate for the dilated-spacing
+    hybrid (Sec 4.4). For the spaced variant see
+    :func:`generate_eb_sampler_spaced`.
+
+    Args:
+        model: The masked diffusion language model.
+        prompt: Input prompt tensor of shape (1, prompt_len).
+        steps: Total denoising steps, distributed evenly across blocks.
+        gen_length: Number of tokens to generate (must divide block_length).
+        block_length: Semi-AR block size.
+        temperature: Gumbel sampling temperature (0 = deterministic).
+        cfg_scale: Classifier-free guidance scale (0 = no guidance).
+        mask_id: Token ID for the [MASK] token.
+        gamma: Entropy budget per step in bits (typical range 0.01–4.0).
+        stop_on_eos: Whether to stop early on EOS / stop tokens.
+        stop_tokens: List of stop-token strings (tokenized via ``tokenizer``).
+        tokenizer: Tokenizer used to encode ``stop_tokens``.
+
+    Returns:
+        Tuple of (generated_sequence, unmasking_stages) where
+            - generated_sequence: complete sequence including prompt
+            - unmasking_stages: tensor tracking when each token was unmasked
+    """
+    if stop_tokens is None:
+        stop_tokens = []
+
+    if tokenizer and stop_tokens:
+        stop_tokens = tokenizer(stop_tokens, add_special_tokens=False)["input_ids"]
+    else:
+        stop_on_eos = False
+
+    device = model.device
+    prompt_len = prompt.shape[1]
+    x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_len] = prompt.clone().to(device)
+    unmasking_stage = torch.zeros_like(x, dtype=torch.long, device='cpu')
+    unmasking_stage[:, :prompt_len] = -1
+
+    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0, "steps must be divisible by num_blocks"
+    steps_per_block = steps // num_blocks
+
+    total_steps = 1
+    stop_generation = False
+
+    for num_block in range(num_blocks):
+        if stop_generation:
+            break
+
+        block_start = prompt_len + num_block * block_length
+        block_end = block_start + block_length
+
+        for _ in range(steps_per_block):
+            mask_index = (x == mask_id)
+
+            if not mask_index[:, block_start:block_end].any():
+                break
+
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[:, :prompt_len] = mask_id
+                logits = model(torch.cat([x, un_x], dim=0)).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x).logits
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            entropy = get_raw_entropy(logits_with_noise)
+
+            block_mask = mask_index[:, block_start:block_end]
+            block_entropy = entropy[:, block_start:block_end]
+            block_entropy_masked = torch.where(
+                block_mask, block_entropy,
+                torch.tensor(float('inf'), device=device),
+            )
+
+            sorted_entropy, sorted_ids = torch.sort(block_entropy_masked[0], dim=-1)
+            valid_mask = sorted_entropy != float('inf')
+            sorted_entropy = sorted_entropy[valid_mask]
+            sorted_ids = sorted_ids[valid_mask]
+
+            if len(sorted_ids) == 0:
+                continue
+
+            # EB-Sampler core: largest prefix whose acc-cummax <= gamma
+            acc_entropy = torch.cumsum(sorted_entropy, dim=0)
+            cummax_entropy = torch.cummax(sorted_entropy, dim=0).values
+            k = (acc_entropy - cummax_entropy <= gamma).sum().item()
+            k = max(1, min(k, len(sorted_ids)))
+
+            absolute_indices = [block_start + idx.item() for idx in sorted_ids[:k]]
+
+            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=device)
+            transfer_index[0, absolute_indices] = True
+            x[transfer_index] = x0[transfer_index]
+            unmasking_stage[transfer_index] = total_steps
+            total_steps += 1
+
+            if check_stop_generation(x, stop_tokens, stop_on_eos, mask_id, prompt_len):
+                stop_generation = True
+                break
+
+    return x, unmasking_stage
+
+
+@torch.no_grad()
+def generate_cb_sampler(
+    model: torch.nn.Module,
+    prompt: torch.Tensor,
+    steps: int = 128,
+    gen_length: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.,
+    cfg_scale: float = 0.,
+    mask_id: int = 126336,
+    tau: float = 0.5,
+    stop_on_eos: bool = True,
+    stop_tokens: Optional[List[str]] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    CB-Sampler — confidence-bounded adaptive unmasking.
+
+    Reference: Wu et al. 2025, "Fast-dLLM". At every denoising step, every
+    masked position whose top-token confidence exceeds ``tau`` is unmasked;
+    the single maximum-confidence position is always unmasked to guarantee
+    progress.
+
+    In our paper this is one of the adaptive baselines used in Appendix B.7
+    and as the substrate for the dilated-spacing hybrid (Sec 4.4). For the
+    spaced variant see :func:`generate_cb_sampler_spaced`.
+
+    Args:
+        model: The masked diffusion language model.
+        prompt: Input prompt tensor of shape (1, prompt_len).
+        steps: Total denoising steps, distributed evenly across blocks.
+        gen_length: Number of tokens to generate (must divide block_length).
+        block_length: Semi-AR block size.
+        temperature: Gumbel sampling temperature (0 = deterministic).
+        cfg_scale: Classifier-free guidance scale (0 = no guidance).
+        mask_id: Token ID for the [MASK] token.
+        tau: Confidence threshold (typical range 0.3–0.9).
+        stop_on_eos: Whether to stop early on EOS / stop tokens.
+        stop_tokens: List of stop-token strings (tokenized via ``tokenizer``).
+        tokenizer: Tokenizer used to encode ``stop_tokens``.
+
+    Returns:
+        Tuple of (generated_sequence, unmasking_stages).
+    """
+    if stop_tokens is None:
+        stop_tokens = []
+
+    if tokenizer and stop_tokens:
+        stop_tokens = tokenizer(stop_tokens, add_special_tokens=False)["input_ids"]
+    else:
+        stop_on_eos = False
+
+    device = model.device
+    prompt_len = prompt.shape[1]
+    x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_len] = prompt.clone().to(device)
+    unmasking_stage = torch.zeros_like(x, dtype=torch.long, device='cpu')
+    unmasking_stage[:, :prompt_len] = -1
+
+    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0, "steps must be divisible by num_blocks"
+    steps_per_block = steps // num_blocks
+
+    total_steps = 1
+    stop_generation = False
+
+    for num_block in range(num_blocks):
+        if stop_generation:
+            break
+
+        block_start = prompt_len + num_block * block_length
+        block_end = block_start + block_length
+
+        for _ in range(steps_per_block):
+            mask_index = (x == mask_id)
+
+            if not mask_index[:, block_start:block_end].any():
+                break
+
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[:, :prompt_len] = mask_id
+                logits = model(torch.cat([x, un_x], dim=0)).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x).logits
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            confidence = get_mask_by_confidence(logits_with_noise, x0)
+
+            block_mask = mask_index[:, block_start:block_end]
+            block_confidence = confidence[:, block_start:block_end]
+
+            above_threshold = (block_confidence >= tau) & block_mask
+            block_confidence_masked = torch.where(
+                block_mask, block_confidence,
+                torch.tensor(-float('inf'), device=device),
+            )
+            max_conf_idx = torch.argmax(block_confidence_masked[0]).item()
+
+            absolute_indices = []
+            for idx in range(block_confidence.shape[1]):
+                if (above_threshold[0, idx] or idx == max_conf_idx) and block_mask[0, idx]:
+                    absolute_indices.append(block_start + idx)
+
+            if not absolute_indices:
+                continue
+
+            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=device)
+            transfer_index[0, absolute_indices] = True
+            x[transfer_index] = x0[transfer_index]
+            unmasking_stage[transfer_index] = total_steps
+            total_steps += 1
+
+            if check_stop_generation(x, stop_tokens, stop_on_eos, mask_id, prompt_len):
+                stop_generation = True
+                break
+
+    return x, unmasking_stage
+
+
+@torch.no_grad()
+def generate_eb_sampler_spaced(
+    model: torch.nn.Module,
+    prompt: torch.Tensor,
+    steps: int = 128,
+    gen_length: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.,
+    cfg_scale: float = 0.,
+    mask_id: int = 126336,
+    gamma: float = 1.0,
+    start_stride: int = 8,
+    stop_on_eos: bool = True,
+    stop_tokens: Optional[List[str]] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    EB-Sampler with the dilated-spacing post-filter (paper Sec 4.4).
+
+    Same as :func:`generate_eb_sampler` but, after EB selects its prefix of
+    low-entropy positions, the candidates are passed through
+    :func:`apply_spacing_filter` with adaptive
+    ``min_gap = max(2, M * start_stride // block_length)``, where ``M`` is the
+    number of still-masked positions in the current block. Rejected positions
+    stay masked and EB reconsiders them at the next step with updated context.
+
+    Setting ``start_stride=0`` recovers pure :func:`generate_eb_sampler`.
+
+    Args:
+        start_stride: Initial gap when the block is fully masked. ``g_0`` in
+            the paper notation. Larger values enforce sparser early unmasking;
+            relaxes toward 1 as the block fills.
+        (Other args identical to :func:`generate_eb_sampler`.)
+
+    Returns:
+        Tuple of (generated_sequence, unmasking_stages).
+    """
+    if stop_tokens is None:
+        stop_tokens = []
+
+    if tokenizer and stop_tokens:
+        stop_tokens = tokenizer(stop_tokens, add_special_tokens=False)["input_ids"]
+    else:
+        stop_on_eos = False
+
+    device = model.device
+    prompt_len = prompt.shape[1]
+    x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_len] = prompt.clone().to(device)
+    unmasking_stage = torch.zeros_like(x, dtype=torch.long, device='cpu')
+    unmasking_stage[:, :prompt_len] = -1
+
+    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0, "steps must be divisible by num_blocks"
+    steps_per_block = steps // num_blocks
+
+    total_steps = 1
+    stop_generation = False
+
+    for num_block in range(num_blocks):
+        if stop_generation:
+            break
+
+        block_start = prompt_len + num_block * block_length
+        block_end = block_start + block_length
+
+        for _ in range(steps_per_block):
+            mask_index = (x == mask_id)
+
+            if not mask_index[:, block_start:block_end].any():
+                break
+
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[:, :prompt_len] = mask_id
+                logits = model(torch.cat([x, un_x], dim=0)).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x).logits
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            entropy = get_raw_entropy(logits_with_noise)
+
+            block_mask = mask_index[:, block_start:block_end]
+            block_entropy = entropy[:, block_start:block_end]
+            block_entropy_masked = torch.where(
+                block_mask, block_entropy,
+                torch.tensor(float('inf'), device=device),
+            )
+
+            sorted_entropy, sorted_ids = torch.sort(block_entropy_masked[0], dim=-1)
+            valid_mask = sorted_entropy != float('inf')
+            sorted_entropy = sorted_entropy[valid_mask]
+            sorted_ids = sorted_ids[valid_mask]
+
+            if len(sorted_ids) == 0:
+                continue
+
+            acc_entropy = torch.cumsum(sorted_entropy, dim=0)
+            cummax_entropy = torch.cummax(sorted_entropy, dim=0).values
+            k = (acc_entropy - cummax_entropy <= gamma).sum().item()
+            k = max(1, min(k, len(sorted_ids)))
+
+            absolute_selected = [block_start + idx.item() for idx in sorted_ids[:k]]
+
+            # Dilated-spacing post-filter
+            if start_stride > 0:
+                M = block_mask.sum().item()
+                min_gap = max(2, int(M * start_stride // block_length))
+                absolute_selected, _ = apply_spacing_filter(absolute_selected, min_gap)
+
+            if not absolute_selected:
+                continue
+
+            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=device)
+            transfer_index[0, absolute_selected] = True
+            x[transfer_index] = x0[transfer_index]
+            unmasking_stage[transfer_index] = total_steps
+            total_steps += 1
+
+            if check_stop_generation(x, stop_tokens, stop_on_eos, mask_id, prompt_len):
+                stop_generation = True
+                break
+
+    return x, unmasking_stage
+
+
+@torch.no_grad()
+def generate_cb_sampler_spaced(
+    model: torch.nn.Module,
+    prompt: torch.Tensor,
+    steps: int = 128,
+    gen_length: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.,
+    cfg_scale: float = 0.,
+    mask_id: int = 126336,
+    tau: float = 0.5,
+    start_stride: int = 8,
+    stop_on_eos: bool = True,
+    stop_tokens: Optional[List[str]] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    CB-Sampler with the dilated-spacing post-filter (paper Sec 4.4).
+
+    Same as :func:`generate_cb_sampler` but, after CB collects every position
+    with confidence >= ``tau``, the candidates (sorted by confidence
+    descending) are passed through :func:`apply_spacing_filter` with adaptive
+    ``min_gap = max(2, M * start_stride // block_length)``.
+
+    Setting ``start_stride=0`` recovers pure :func:`generate_cb_sampler`.
+
+    Args:
+        start_stride: Initial gap when the block is fully masked. ``g_0`` in
+            the paper notation.
+        (Other args identical to :func:`generate_cb_sampler`.)
+
+    Returns:
+        Tuple of (generated_sequence, unmasking_stages).
+    """
+    if stop_tokens is None:
+        stop_tokens = []
+
+    if tokenizer and stop_tokens:
+        stop_tokens = tokenizer(stop_tokens, add_special_tokens=False)["input_ids"]
+    else:
+        stop_on_eos = False
+
+    device = model.device
+    prompt_len = prompt.shape[1]
+    x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_len] = prompt.clone().to(device)
+    unmasking_stage = torch.zeros_like(x, dtype=torch.long, device='cpu')
+    unmasking_stage[:, :prompt_len] = -1
+
+    assert gen_length % block_length == 0, "gen_length must be divisible by block_length"
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0, "steps must be divisible by num_blocks"
+    steps_per_block = steps // num_blocks
+
+    total_steps = 1
+    stop_generation = False
+
+    for num_block in range(num_blocks):
+        if stop_generation:
+            break
+
+        block_start = prompt_len + num_block * block_length
+        block_end = block_start + block_length
+
+        for _ in range(steps_per_block):
+            mask_index = (x == mask_id)
+
+            if not mask_index[:, block_start:block_end].any():
+                break
+
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[:, :prompt_len] = mask_id
+                logits = model(torch.cat([x, un_x], dim=0)).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x).logits
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            confidence = get_mask_by_confidence(logits_with_noise, x0)
+
+            block_mask = mask_index[:, block_start:block_end]
+            block_confidence = confidence[:, block_start:block_end]
+
+            above_threshold = (block_confidence >= tau) & block_mask
+            block_confidence_masked = torch.where(
+                block_mask, block_confidence,
+                torch.tensor(-float('inf'), device=device),
+            )
+            max_conf_idx = torch.argmax(block_confidence_masked[0]).item()
+
+            selected_with_conf = []
+            for idx in range(block_confidence.shape[1]):
+                if (above_threshold[0, idx] or idx == max_conf_idx) and block_mask[0, idx]:
+                    selected_with_conf.append(
+                        (block_start + idx, block_confidence[0, idx].item())
+                    )
+
+            if not selected_with_conf:
+                continue
+
+            # Sort by confidence descending (best first) for the spacing filter
+            selected_with_conf.sort(key=lambda x: x[1], reverse=True)
+            absolute_selected = [pos for pos, _ in selected_with_conf]
+
+            # Dilated-spacing post-filter
+            if start_stride > 0:
+                M = block_mask.sum().item()
+                min_gap = max(2, int(M * start_stride // block_length))
+                absolute_selected, _ = apply_spacing_filter(absolute_selected, min_gap)
+
+            if not absolute_selected:
+                continue
+
+            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=device)
+            transfer_index[0, absolute_selected] = True
+            x[transfer_index] = x0[transfer_index]
+            unmasking_stage[transfer_index] = total_steps
+            total_steps += 1
+
             if check_stop_generation(x, stop_tokens, stop_on_eos, mask_id, prompt_len):
                 stop_generation = True
                 break
